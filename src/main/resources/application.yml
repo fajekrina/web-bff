@@ -21,3 +21,4 @@ sdui:
     origins: http://localhost:5180,http://localhost:5181
   upstream:
     delivery-service: ${SDUI_DELIVERY_SERVICE:http://localhost:8100/api}
+    summary-service: ${SDUI_SUMMARY_SERVICE:http://localhost:8103/api}

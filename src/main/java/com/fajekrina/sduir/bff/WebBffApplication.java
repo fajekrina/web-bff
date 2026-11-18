@@ -5,6 +5,7 @@ import com.fajekrina.sduir.foundation.InternalToken;
 import com.fajekrina.sduir.foundation.Json;
 import com.fajekrina.sduir.foundation.ServiceClient;
 import com.fajekrina.sduir.foundation.SduiProblem;
+import com.fajekrina.sduir.foundation.SpecContract;
 import com.fajekrina.sduir.foundation.bff.BffGuard;
 import com.fajekrina.sduir.foundation.bff.BffSessions;
 import com.fajekrina.sduir.foundation.bff.Relay;
@@ -21,6 +22,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -53,22 +55,28 @@ public class WebBffApplication {
 
     /// `/bff/*` for the customer app: a session (guest or dev login) with its CSRF token,
     /// the public client API under `/bff/sdui/**`, and named domain requests under
-    /// `/bff/api/{request}` (the app bundle maps `api.request` names to these).
+    /// `/bff/api/{request}` (the app bundle maps `api.request` names to these), and the chart
+    /// data summaries under `GET /bff/api/summaries/{name}` (summary-service).
     @RestController
     @RequestMapping("/bff")
     static class WebController {
         private final BffSessions sessions;
         private final BffGuard guard;
         private final Relay delivery;
+        private final ServiceClient deliveryClient;
+        private final ServiceClient summaries;
         /// the demo "domain services": request name → handler(params, actor)
         private final Map<String, BiFunction<JsonNode, Actor, Map<String, Object>>> domain = Map.of(
             "submitCheckout", WebController::checkout
         );
 
-        WebController(BffSessions sessions, BffGuard guard, InternalToken tokens, @Value("${sdui.upstream.delivery-service}") String deliveryService) {
+        WebController(BffSessions sessions, BffGuard guard, InternalToken tokens, @Value("${sdui.upstream.delivery-service}") String deliveryService,
+                      @Value("${sdui.upstream.summary-service}") String summaryService) {
             this.sessions = sessions;
             this.guard = guard;
-            this.delivery = new Relay(new ServiceClient(deliveryService, "delivery-service", tokens), "/bff/sdui", "/client");
+            this.deliveryClient = new ServiceClient(deliveryService, "delivery-service", tokens);
+            this.delivery = new Relay(deliveryClient, "/bff/sdui", "/client");
+            this.summaries = new ServiceClient(summaryService, "summary-service", tokens);
         }
 
         /// The current session, or a new guest session: `{ user, csrf }`.
@@ -101,12 +109,33 @@ public class WebBffApplication {
             return delivery.forward(request, ServiceClient.service("web-bff"));
         }
 
+        /// A published picture (`image.name` = `img_…`; the app's `assetURL` points here). Public
+        /// like the rest of the client API; binary, so not through the text relay.
+        @GetMapping("/assets/{id}")
+        ResponseEntity<byte[]> asset(@PathVariable String id, @RequestHeader(value = "If-None-Match", required = false) String inm) {
+            if (!id.matches("^img_[0-9a-f]{32}$")) throw SduiProblem.badRequest("not an asset id: " + id);
+            return deliveryClient.bytes("/client/assets/" + id, ServiceClient.service("web-bff"), inm);
+        }
+
         @PostMapping("/api/{request}")
         ResponseEntity<String> api(@PathVariable String request, @RequestBody(required = false) String body, HttpServletRequest http) {
             Actor actor = guard.require(http).actor();
             var handler = domain.get(request);
             if (handler == null) throw SduiProblem.notFound("unknown request " + request);
             return Json.status(HttpStatus.OK, handler.apply(body == null || body.isBlank() ? Json.object() : Json.parse(body), actor));
+        }
+
+        /// A chart's data summary (`chart.source`): `{ items: [{ key, label, value }] }` for the
+        /// merchant whose page asks (`X-Sdui-Merchant`, set by the app engine). A session is
+        /// required (a guest session is fine); it is a read, so no CSRF.
+        @GetMapping("/api/summaries/{name}")
+        ResponseEntity<String> summary(@PathVariable String name, @RequestHeader(name = "X-Sdui-Merchant", required = false) String merchant, HttpServletRequest http) {
+            guard.require(http);
+            if (!SpecContract.isIdentifier(name)) throw SduiProblem.badRequest("summary name must be an identifier");
+            String m = merchant == null || merchant.isBlank() ? "merchant_demo" : merchant;
+            if (!SpecContract.isIdentifier(m)) throw SduiProblem.badRequest("X-Sdui-Merchant must be a merchant id");
+            var upstream = summaries.get("/summaries/" + name + "?merchant=" + m, ServiceClient.service("web-bff"));
+            return ResponseEntity.status(upstream.getStatusCode()).header("Content-Type", "application/json").header("Cache-Control", "no-store").body(upstream.getBody());
         }
 
         private static Map<String, Object> checkout(JsonNode params, Actor actor) {

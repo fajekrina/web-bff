@@ -36,6 +36,14 @@ class WebBffIT {
                 ex.getResponseBody().write(out);
                 ex.close();
             });
+            // a fake summary-service: echoes what it was asked, as a data summary
+            server.createContext("/api/summaries/", (ex) -> {
+                byte[] out = ("{\"asked\":\"" + ex.getRequestURI() + "\",\"items\":[{\"key\":\"jan\",\"label\":\"Januari\",\"value\":1}]}").getBytes(StandardCharsets.UTF_8);
+                ex.getResponseHeaders().add("Content-Type", "application/json");
+                ex.sendResponseHeaders(200, out.length);
+                ex.getResponseBody().write(out);
+                ex.close();
+            });
             server.start();
             return server;
         } catch (java.io.IOException e) {
@@ -46,6 +54,7 @@ class WebBffIT {
     @DynamicPropertySource
     static void upstreams(DynamicPropertyRegistry registry) {
         registry.add("sdui.upstream.delivery-service", () -> "http://localhost:" + DELIVERY.getAddress().getPort() + "/api");
+        registry.add("sdui.upstream.summary-service", () -> "http://localhost:" + DELIVERY.getAddress().getPort() + "/api");
     }
 
     @AfterAll
@@ -55,12 +64,17 @@ class WebBffIT {
     final HttpClient http = HttpClient.newHttpClient();
 
     HttpResponse<String> call(String method, String path, String cookie, String csrf, String body, String inm) throws Exception {
+        return call(method, path, cookie, csrf, body, inm, null);
+    }
+
+    HttpResponse<String> call(String method, String path, String cookie, String csrf, String body, String inm, String merchant) throws Exception {
         var req = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path))
             .method(method, body == null ? HttpRequest.BodyPublishers.noBody() : HttpRequest.BodyPublishers.ofString(body))
             .header("Content-Type", "application/json");
         if (cookie != null) req.header("Cookie", cookie);
         if (csrf != null) req.header("X-CSRF-Token", csrf);
         if (inm != null) req.header("If-None-Match", inm);
+        if (merchant != null) req.header("X-Sdui-Merchant", merchant);
         return http.send(req.build(), HttpResponse.BodyHandlers.ofString());
     }
 
@@ -88,5 +102,18 @@ class WebBffIT {
         assertThat(call("POST", "/bff/api/dropTables", cookie, csrf, "{}", null).statusCode()).isEqualTo(404);
         // the same session is reused
         assertThat(Json.parse(call("GET", "/bff/session", cookie, null, null, null).body()).path("csrf").asText()).isEqualTo(csrf);
+    }
+
+    @Test
+    void chartSummariesAreRelayedForThePageMerchant() throws Exception {
+        assertThat(call("GET", "/bff/api/summaries/sales", null, null, null, null).statusCode()).isEqualTo(401);
+        var session = call("GET", "/bff/session", null, null, null, null);
+        String setCookie = session.headers().firstValue("Set-Cookie").orElseThrow();
+        String cookie = setCookie.substring(0, setCookie.indexOf(';'));
+        var res = call("GET", "/bff/api/summaries/sales", cookie, null, null, null, "toko_baru");     // a GET: no CSRF
+        assertThat(res.statusCode()).isEqualTo(200);
+        assertThat(Json.parse(res.body()).path("asked").asText()).isEqualTo("/api/summaries/sales?merchant=toko_baru");
+        assertThat(Json.parse(res.body()).path("items").get(0).path("label").asText()).isEqualTo("Januari");
+        assertThat(call("GET", "/bff/api/summaries/sales", cookie, null, null, null, "../x").statusCode()).isEqualTo(400);
     }
 }
